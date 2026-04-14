@@ -22,6 +22,46 @@ plain='\033[0m'
 # Make sure run with root
 [[ $EUID -ne 0 ]] && echo -e "[${red}Error${plain}]Please run this script with ROOT!" && exit 1
 
+check_system(){
+    if [[ ! -f /etc/os-release ]]; then
+        echo -e "[${red}Error${plain}] Cannot detect OS."
+        exit 1
+    fi
+
+    . /etc/os-release
+    if [[ "${ID_LIKE}" != *"rhel"* && "${ID}" != "rhel" && "${ID}" != "rocky" && "${ID}" != "almalinux" && "${ID}" != "centos" && "${ID}" != "ol" ]]; then
+        echo -e "[${red}Error${plain}] This script supports modern RHEL-family distributions."
+        exit 1
+    fi
+
+    if ! command -v dnf >/dev/null 2>&1; then
+        echo -e "[${red}Error${plain}] dnf is required but not found."
+        exit 1
+    fi
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo -e "[${red}Error${plain}] systemd is required but not found."
+        exit 1
+    fi
+}
+
+install_dependencies(){
+    echo "Installing required packages..."
+    dnf -y install curl wget tar sed
+    if systemctl is-active --quiet firewalld; then
+        echo "firewalld status: active, firewall rules will be used."
+    else
+        echo "firewalld status: inactive, firewall rules will be skipped."
+    fi
+}
+
+restorecon_if_needed(){
+    target_path="$1"
+    if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+        restorecon -v "${target_path}" >/dev/null 2>&1
+    fi
+}
+
 download_file(){
 	echo "Checking System..."
 
@@ -51,12 +91,13 @@ download_file(){
     rm -f mtg-${version}-linux-${bit}.tar.gz
     rm -rf mtg-${version}-linux-${bit}
     chmod +x /usr/bin/mtg
+    restorecon_if_needed /usr/bin/mtg
     echo -e "mtg-${version}-linux-${bit}.tar.gz installed successfully, start to configure..."
 }
 
 configure_mtg(){
     echo -e "Configuring mtg..."
-    wget -N --no-check-certificate -O /etc/mtg.toml https://raw.githubusercontent.com/missuo/MTProxy/main/mtg.toml
+    wget -N --no-check-certificate -O /etc/mtg.toml https://raw.githubusercontent.com/samotnij/MTProxy/main/mtg.toml
     
     echo ""
     read -p "Please enter a spoofed domain (default itunes.apple.com): " domain
@@ -78,13 +119,18 @@ configure_mtg(){
 
 configure_systemctl(){
     echo -e "Configuring systemctl..."
-    wget -N --no-check-certificate -O /etc/systemd/system/mtg.service https://raw.githubusercontent.com/missuo/MTProxy/main/mtg.service
+    wget -N --no-check-certificate -O /etc/systemd/system/mtg.service https://raw.githubusercontent.com/samotnij/MTProxy/main/mtg.service
+    systemctl daemon-reload
     systemctl enable mtg
     systemctl start mtg
-    echo "mtg configured successfully, start to configure firewall..."
-    systemctl disable firewalld
-    systemctl stop firewalld
-    ufw disable
+    echo "mtg configured successfully, start to configure Rocky Linux firewall..."
+    if systemctl is-active --quiet firewalld; then
+        firewall-cmd --permanent --add-port="${port}"/tcp >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+        echo "firewalld: rule for port ${port}/tcp applied successfully."
+    else
+        echo "firewalld: inactive, firewall configuration not used."
+    fi
     echo "mtg start successfully, enjoy it!"
     echo ""
     # echo "mtg configuration:"
@@ -97,9 +143,20 @@ configure_systemctl(){
 }
 
 change_port(){
+    old_port=$(sed -n 's/^bind-to *= *"0\.0\.0\.0:\([0-9]\+\)".*/\1/p' /etc/mtg.toml)
     read -p "Enter the port you want to modify(default 8443):" port
 	[ -z "${port}" ] && port="8443"
     sed -i "s/bind-to.*/bind-to = \"0.0.0.0:${port}\"/g" /etc/mtg.toml
+    if systemctl is-active --quiet firewalld; then
+        if [[ -n "${old_port}" && "${old_port}" != "${port}" ]]; then
+            firewall-cmd --permanent --remove-port="${old_port}"/tcp >/dev/null 2>&1
+        fi
+        firewall-cmd --permanent --add-port="${port}"/tcp >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+        echo "firewalld: port rule updated successfully (${old_port:-none} -> ${port})."
+    else
+        echo "firewalld: inactive, port rule update skipped."
+    fi
     echo "Restarting MTProxy..."
     systemctl restart mtg
     echo "MTProxy restarted successfully!"
@@ -127,7 +184,7 @@ update_mtg(){
 start_menu() {
     clear
     echo -e "  MTProxy v2 One-Click Installation
----- by Vincent | github.com/missuo/MTProxy ----
+---- by Vincent | github.com/samotnij/MTProxy ----
  ${green} 1.${plain} Install MTProxy
  ${green} 2.${plain} Uninstall MTProxy
 ————————————
@@ -144,6 +201,8 @@ start_menu() {
 	read -e -p " Please enter the number [0-8]: " num
 	case "$num" in
     1)
+        check_system
+        install_dependencies
 		download_file
         configure_mtg
         configure_systemctl
