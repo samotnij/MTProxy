@@ -203,7 +203,6 @@ get_prometheus_metrics(){
     [[ "${http_path}" != /* ]] && http_path="/${http_path}"
 
     metrics_url="http://${bind_to}${http_path}"
-    PROMETHEUS_PREFIX="${prefix}"
     curl -sf --max-time 2 "${metrics_url}" 2>/dev/null
 }
 
@@ -231,7 +230,7 @@ count_connections_fallback(){
 
 show_status(){
     local mtg_version active_state sub_state main_pid since memory port secret secret_masked
-    local access_json public_ip tg_url metrics client_conn tg_conn fronting_conn fallback_conn
+    local access_json public_ip tg_url metrics prom_prefix client_conn tg_conn fronting_conn fallback_conn
     local crit_logs err_logs replay blocklisted concurrency_limited
 
     echo -e "========== ${green}MTProxy Status${plain} =========="
@@ -292,11 +291,13 @@ show_status(){
 
     echo ""
     echo "--- Connections ---"
+    prom_prefix=$(awk '/^\[stats\.prometheus\]/{f=1; next} /^\[/{f=0} f && /^metric-prefix *=/{gsub(/.*= *"|"/, ""); print; exit}' /etc/mtg.toml)
+    [[ -z "${prom_prefix}" ]] && prom_prefix="mtg"
     metrics=$(get_prometheus_metrics)
     if [[ -n "${metrics}" ]]; then
-        client_conn=$(sum_prometheus_gauge "${PROMETHEUS_PREFIX}_client_connections" "${metrics}")
-        tg_conn=$(sum_prometheus_gauge "${PROMETHEUS_PREFIX}_telegram_connections" "${metrics}")
-        fronting_conn=$(sum_prometheus_gauge "${PROMETHEUS_PREFIX}_domain_fronting_connections" "${metrics}")
+        client_conn=$(sum_prometheus_gauge "${prom_prefix}_client_connections" "${metrics}")
+        tg_conn=$(sum_prometheus_gauge "${prom_prefix}_telegram_connections" "${metrics}")
+        fronting_conn=$(sum_prometheus_gauge "${prom_prefix}_domain_fronting_connections" "${metrics}")
         echo "Active client connections: ${client_conn}"
         echo "Telegram upstream connections: ${tg_conn}"
         [[ "${fronting_conn}" != "0" ]] && echo "Domain fronting connections: ${fronting_conn}"
