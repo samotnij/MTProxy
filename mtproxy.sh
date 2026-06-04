@@ -181,6 +181,167 @@ update_mtg(){
     echo "MTProxy restarted successfully!"
 }
 
+get_mtg_port(){
+    sed -n 's/^bind-to *= *"[^"]*:\([0-9]\+\)".*/\1/p' /etc/mtg.toml 2>/dev/null | head -1
+}
+
+get_prometheus_metrics(){
+    local prom_enabled bind_to http_path prefix metrics_url
+
+    [[ -f /etc/mtg.toml ]] || return 1
+
+    prom_enabled=$(awk '/^\[stats\.prometheus\]/{f=1; next} /^\[/{f=0} f && /^enabled *=/{gsub(/.*= */, ""); gsub(/"/, ""); print; exit}' /etc/mtg.toml)
+    [[ "${prom_enabled}" == "true" ]] || return 1
+
+    bind_to=$(awk '/^\[stats\.prometheus\]/{f=1; next} /^\[/{f=0} f && /^bind-to *=/{gsub(/.*= *"|"/, ""); print; exit}' /etc/mtg.toml)
+    http_path=$(awk '/^\[stats\.prometheus\]/{f=1; next} /^\[/{f=0} f && /^http-path *=/{gsub(/.*= *"|"/, ""); print; exit}' /etc/mtg.toml)
+    prefix=$(awk '/^\[stats\.prometheus\]/{f=1; next} /^\[/{f=0} f && /^metric-prefix *=/{gsub(/.*= *"|"/, ""); print; exit}' /etc/mtg.toml)
+
+    [[ -z "${bind_to}" ]] && bind_to="127.0.0.1:3129"
+    [[ -z "${http_path}" ]] && http_path="/"
+    [[ -z "${prefix}" ]] && prefix="mtg"
+    [[ "${http_path}" != /* ]] && http_path="/${http_path}"
+
+    metrics_url="http://${bind_to}${http_path}"
+    PROMETHEUS_PREFIX="${prefix}"
+    curl -sf --max-time 2 "${metrics_url}" 2>/dev/null
+}
+
+sum_prometheus_gauge(){
+    local metric="$1"
+    local metrics="$2"
+    echo "${metrics}" | awk -v m="${metric}" '
+        $1 ~ "^" m "($|\\{)" {
+            if ($2 ~ /^[0-9]+(\.[0-9]+)?$/) sum += $2
+        }
+        END { printf "%.0f", sum + 0 }
+    '
+}
+
+count_connections_fallback(){
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -Htan state established "( sport = :${port} )" 2>/dev/null | wc -l | tr -d ' '
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tn 2>/dev/null | awk -v p=":${port}" '$4 ~ p && $6 == "ESTABLISHED" { c++ } END { print c + 0 }'
+    else
+        echo "?"
+    fi
+}
+
+show_status(){
+    local mtg_version active_state sub_state main_pid since memory port secret secret_masked
+    local access_json public_ip tg_url metrics client_conn tg_conn fronting_conn fallback_conn
+    local crit_logs err_logs replay blocklisted concurrency_limited
+
+    echo -e "========== ${green}MTProxy Status${plain} =========="
+    echo ""
+
+    if [[ ! -f /etc/mtg.toml ]]; then
+        echo -e "[${red}Error${plain}] MTProxy is not installed (/etc/mtg.toml not found)."
+        return 1
+    fi
+
+    if [[ ! -x /usr/bin/mtg ]]; then
+        echo -e "[${red}Error${plain}] mtg binary not found."
+        return 1
+    fi
+
+    mtg_version=$(/usr/bin/mtg --version 2>/dev/null | head -1)
+    [[ -n "${mtg_version}" ]] && echo "Version: ${mtg_version}"
+
+    if systemctl is-active --quiet mtg 2>/dev/null; then
+        echo -e "Service: ${green}running${plain}"
+    else
+        echo -e "Service: ${red}stopped${plain}"
+    fi
+
+    active_state=$(systemctl show mtg -p ActiveState --value 2>/dev/null)
+    sub_state=$(systemctl show mtg -p SubState --value 2>/dev/null)
+    [[ -n "${active_state}" ]] && echo "State: ${active_state} (${sub_state})"
+
+    main_pid=$(systemctl show mtg -p MainPID --value 2>/dev/null)
+    [[ -n "${main_pid}" && "${main_pid}" != "0" ]] && echo "PID: ${main_pid}"
+
+    since=$(systemctl show mtg -p ActiveEnterTimestamp --value 2>/dev/null)
+    [[ -n "${since}" && "${since}" != "n/a" ]] && echo "Started: ${since}"
+
+    memory=$(systemctl show mtg -p MemoryCurrent --value 2>/dev/null)
+    if [[ -n "${memory}" && "${memory}" != "[not set]" && "${memory}" != "infinity" ]]; then
+        echo "Memory: ~$(( memory / 1024 / 1024 )) MiB"
+    fi
+
+    echo ""
+    echo "--- Configuration ---"
+    port=$(get_mtg_port)
+    [[ -n "${port}" ]] && echo "Listen port: ${port}"
+
+    secret=$(sed -n 's/^secret *= *"\([^"]*\)".*/\1/p' /etc/mtg.toml | head -1)
+    if [[ -n "${secret}" ]]; then
+        secret_masked="${secret:0:8}...${secret: -8}"
+        echo "Secret: ${secret_masked}"
+    fi
+
+    access_json=$(/usr/bin/mtg access /etc/mtg.toml 2>/dev/null)
+    if [[ -n "${access_json}" ]]; then
+        public_ip=$(echo "${access_json}" | grep -o '"ip"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+        tg_url=$(echo "${access_json}" | grep -o '"tg_url"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+        [[ -n "${public_ip}" ]] && echo "Public IP: ${public_ip}"
+        [[ -n "${tg_url}" ]] && echo "Proxy link: ${tg_url}"
+    fi
+
+    echo ""
+    echo "--- Connections ---"
+    metrics=$(get_prometheus_metrics)
+    if [[ -n "${metrics}" ]]; then
+        client_conn=$(sum_prometheus_gauge "${PROMETHEUS_PREFIX}_client_connections" "${metrics}")
+        tg_conn=$(sum_prometheus_gauge "${PROMETHEUS_PREFIX}_telegram_connections" "${metrics}")
+        fronting_conn=$(sum_prometheus_gauge "${PROMETHEUS_PREFIX}_domain_fronting_connections" "${metrics}")
+        echo "Active client connections: ${client_conn}"
+        echo "Telegram upstream connections: ${tg_conn}"
+        [[ "${fronting_conn}" != "0" ]] && echo "Domain fronting connections: ${fronting_conn}"
+
+        replay=$(echo "${metrics}" | awk '/^[^#]/ && /_replay_attacks / { print $2; exit }')
+        blocklisted=$(echo "${metrics}" | awk '/^[^#]/ && /_ip_blocklisted / { sum += $2 } END { print sum + 0 }')
+        concurrency_limited=$(echo "${metrics}" | awk '/^[^#]/ && /_concurrency_limited / { print $2; exit }')
+        [[ "${replay}" != "0" && -n "${replay}" ]] && echo -e "${yellow}Replay attacks detected: ${replay}${plain}"
+        [[ "${blocklisted}" != "0" ]] && echo -e "${yellow}Blocklisted connection attempts: ${blocklisted}${plain}"
+        [[ "${concurrency_limited}" != "0" && -n "${concurrency_limited}" ]] && echo -e "${yellow}Rejected by concurrency limit: ${concurrency_limited}${plain}"
+    elif [[ -n "${port}" ]] && systemctl is-active --quiet mtg 2>/dev/null; then
+        fallback_conn=$(count_connections_fallback "${port}")
+        echo "Active connections (port ${port}): ${fallback_conn}"
+        echo -e "${yellow}Tip: enable [stats.prometheus] in /etc/mtg.toml for detailed metrics.${plain}"
+    else
+        echo "Connections: n/a (service not running or metrics unavailable)"
+    fi
+
+    echo ""
+    echo "--- Recent critical issues ---"
+    if command -v journalctl >/dev/null 2>&1; then
+        crit_logs=$(journalctl -u mtg -p emerg..crit --no-pager -n 5 -o short-iso 2>/dev/null)
+        err_logs=$(journalctl -u mtg -p err..err --no-pager -n 5 -o short-iso 2>/dev/null)
+
+        if [[ -n "${crit_logs}" ]]; then
+            echo -e "${red}Critical / alert / emergency:${plain}"
+            echo "${crit_logs}"
+        fi
+
+        if [[ -n "${err_logs}" ]]; then
+            echo -e "${yellow}Recent errors:${plain}"
+            echo "${err_logs}"
+        fi
+
+        if [[ -z "${crit_logs}" && -z "${err_logs}" ]]; then
+            echo -e "${green}No critical or error log entries found.${plain}"
+        fi
+    else
+        echo "journalctl not available."
+    fi
+
+    echo ""
+    echo "========================================"
+}
+
 start_menu() {
     clear
     echo -e "  MTProxy v2 One-Click Installation
@@ -194,11 +355,12 @@ start_menu() {
  ${green} 6.${plain} Change Listen Port
  ${green} 7.${plain} Change Secret
  ${green} 8.${plain} Update MTProxy
+ ${green} 9.${plain} Show Status
 ————————————
  ${green} 0.${plain} Exit
 ————————————" && echo
 
-	read -e -p " Please enter the number [0-8]: " num
+	read -e -p " Please enter the number [0-9]: " num
 	case "$num" in
     1)
         check_system
@@ -242,10 +404,19 @@ start_menu() {
     8)
         update_mtg
         ;;
+    9)
+        show_status
+        ;;
     0) exit 0
         ;;
-    *) echo -e "${Error} Please enter a number [0-8]: "
+    *) echo -e "${Error} Please enter a number [0-9]: "
         ;;
     esac
 }
+
+if [[ "$1" == "status" ]]; then
+    show_status
+    exit $?
+fi
+
 start_menu
